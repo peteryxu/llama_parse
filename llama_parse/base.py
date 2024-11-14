@@ -1,6 +1,6 @@
 import os
 import asyncio
-from io import TextIOWrapper
+from urllib.parse import urlparse
 
 import httpx
 import mimetypes
@@ -11,8 +11,7 @@ from contextlib import asynccontextmanager
 from io import BufferedIOBase
 
 from fsspec import AbstractFileSystem
-from fsspec.spec import AbstractBufferedFile
-from llama_index.core.async_utils import run_jobs
+from llama_index.core.async_utils import asyncio_run, run_jobs
 from llama_index.core.bridge.pydantic import Field, field_validator
 from llama_index.core.constants import DEFAULT_BASE_URL
 from llama_index.core.readers.base import BasePydanticReader
@@ -95,6 +94,10 @@ class LlamaParse(BasePydanticReader):
         default=False,
         description="Use our best parser mode if set to True.",
     )
+    continuous_mode: bool = Field(
+        default=False,
+        description="Parse documents continuously, leading to better results on documents where tables span across two pages.",
+    )
     do_not_unroll_columns: Optional[bool] = Field(
         default=False,
         description="If set to true, the parser will keep column in the text according to document layout. Reduce reconstruction accuracy, and LLM's/embedings performances in most case.",
@@ -118,6 +121,10 @@ class LlamaParse(BasePydanticReader):
     gpt4o_api_key: Optional[str] = Field(
         default=None,
         description="The API key for the GPT-4o API. Lowers the cost of parsing.",
+    )
+    guess_xlsx_sheet_names: Optional[bool] = Field(
+        default=False,
+        description="Whether to guess the sheet names of the xlsx file.",
     )
     bounding_box: Optional[str] = Field(
         default=None,
@@ -154,6 +161,38 @@ class LlamaParse(BasePydanticReader):
     custom_client: Optional[httpx.AsyncClient] = Field(
         default=None, description="A custom HTTPX client to use for sending requests."
     )
+    disable_ocr: bool = Field(
+        default=False,
+        description="Disable the OCR on the document. LlamaParse will only extract the copyable text from the document.",
+    )
+    is_formatting_instruction: bool = Field(
+        default=True,
+        description="Allow the parsing instruction to also format the output. Disable to have a cleaner markdown output.",
+    )
+    annotate_links: bool = Field(
+        default=False,
+        description="Annotate links found in the document to extract their URL.",
+    )
+    webhook_url: Optional[str] = Field(
+        default=None,
+        description="A URL that needs to be called at the end of the parsing job.",
+    )
+    azure_openai_deployment_name: Optional[str] = Field(
+        default=None, description="Azure Openai Deployment Name"
+    )
+    azure_openai_endpoint: Optional[str] = Field(
+        default=None, description="Azure Openai Endpoint"
+    )
+    azure_openai_api_version: Optional[str] = Field(
+        default=None, description="Azure Openai API Version"
+    )
+    azure_openai_key: Optional[str] = Field(
+        default=None, description="Azure Openai Key"
+    )
+    http_proxy: Optional[str] = Field(
+        default=None,
+        description="(optional) If set with input_url will use the specified http proxy to download the file.",
+    )
 
     @field_validator("api_key", mode="before", check_fields=True)
     @classmethod
@@ -185,6 +224,28 @@ class LlamaParse(BasePydanticReader):
             async with httpx.AsyncClient(timeout=self.max_timeout) as client:
                 yield client
 
+    def _is_input_url(self, file_path: FileInput) -> bool:
+        """Check if the input is a valid URL.
+
+        This method checks for:
+        - Proper URL scheme (http/https)
+        - Valid URL structure
+        - Network location (domain)
+        """
+        if not isinstance(file_path, str):
+            return False
+        try:
+            result = urlparse(file_path)
+            return all(
+                [
+                    result.scheme in ("http", "https"),
+                    result.netloc,  # Has domain
+                    result.scheme,  # Has scheme
+                ]
+            )
+        except Exception:
+            return False
+
     # upload a document and get back a job_id
     async def _create_job(
         self,
@@ -196,6 +257,7 @@ class LlamaParse(BasePydanticReader):
         url = f"{self.base_url}/api/parsing/upload"
         files = None
         file_handle = None
+        input_url = file_input if self._is_input_url(file_input) else None
 
         if isinstance(file_input, (bytes, BufferedIOBase)):
             if not extra_info or "file_name" not in extra_info:
@@ -205,6 +267,8 @@ class LlamaParse(BasePydanticReader):
             file_name = extra_info["file_name"]
             mime_type = mimetypes.guess_type(file_name)[0]
             files = {"file": (file_name, file_input, mime_type)}
+        elif input_url is not None:
+            files = None
         elif isinstance(file_input, (str, Path, PurePosixPath, PurePath)):
             file_path = str(file_input)
             file_ext = os.path.splitext(file_path)[1].lower()
@@ -232,6 +296,7 @@ class LlamaParse(BasePydanticReader):
             "do_not_cache": self.do_not_cache,
             "fast_mode": self.fast_mode,
             "premium_mode": self.premium_mode,
+            "continuous_mode": self.continuous_mode,
             "do_not_unroll_columns": self.do_not_unroll_columns,
             "gpt4o_mode": self.gpt4o_mode,
             "gpt4o_api_key": self.gpt4o_api_key,
@@ -239,6 +304,11 @@ class LlamaParse(BasePydanticReader):
             "use_vendor_multimodal_model": self.use_vendor_multimodal_model,
             "vendor_multimodal_model_name": self.vendor_multimodal_model_name,
             "take_screenshot": self.take_screenshot,
+            "disable_ocr": self.disable_ocr,
+            "guess_xlsx_sheet_names": self.guess_xlsx_sheet_names,
+            "is_formatting_instruction": self.is_formatting_instruction,
+            "annotate_links": self.annotate_links,
+            "from_python_package": True,
         }
 
         # only send page separator to server if it is not None
@@ -258,6 +328,29 @@ class LlamaParse(BasePydanticReader):
         if self.target_pages is not None:
             data["target_pages"] = self.target_pages
 
+        if self.webhook_url is not None:
+            data["webhook_url"] = self.webhook_url
+
+        # Azure OpenAI
+        if self.azure_openai_deployment_name is not None:
+            data["azure_openai_deployment_name"] = self.azure_openai_deployment_name
+
+        if self.azure_openai_endpoint is not None:
+            data["azure_openai_endpoint"] = self.azure_openai_endpoint
+
+        if self.azure_openai_api_version is not None:
+            data["azure_openai_api_version"] = self.azure_openai_api_version
+
+        if self.azure_openai_key is not None:
+            data["azure_openai_key"] = self.azure_openai_key
+
+        if input_url is not None:
+            files = None
+            data["input_url"] = str(input_url)
+
+        if self.http_proxy is not None:
+            data["http_proxy"] = self.http_proxy
+
         try:
             async with self.client_context() as client:
                 response = await client.post(
@@ -273,12 +366,6 @@ class LlamaParse(BasePydanticReader):
         finally:
             if file_handle is not None:
                 file_handle.close()
-
-    @staticmethod
-    def __get_filename(f: Union[TextIOWrapper, AbstractBufferedFile]) -> str:
-        if isinstance(f, TextIOWrapper):
-            return f.name
-        return f.full_name
 
     async def _get_job_result(
         self, job_id: str, result_type: str, verbose: bool = False
@@ -373,7 +460,7 @@ class LlamaParse(BasePydanticReader):
         fs: Optional[AbstractFileSystem] = None,
     ) -> List[Document]:
         """Load data from the input path."""
-        if isinstance(file_path, (str, Path, bytes, BufferedIOBase)):
+        if isinstance(file_path, (str, PurePosixPath, Path, bytes, BufferedIOBase)):
             return await self._aload_data(
                 file_path, extra_info=extra_info, fs=fs, verbose=self.verbose
             )
@@ -415,7 +502,7 @@ class LlamaParse(BasePydanticReader):
     ) -> List[Document]:
         """Load data from the input path."""
         try:
-            return asyncio.run(self.aload_data(file_path, extra_info, fs=fs))
+            return asyncio_run(self.aload_data(file_path, extra_info, fs=fs))
         except RuntimeError as e:
             if nest_asyncio_err in str(e):
                 raise RuntimeError(nest_asyncio_msg)
@@ -482,7 +569,7 @@ class LlamaParse(BasePydanticReader):
     ) -> List[dict]:
         """Parse the input path."""
         try:
-            return asyncio.run(self.aget_json(file_path, extra_info))
+            return asyncio_run(self.aget_json(file_path, extra_info))
         except RuntimeError as e:
             if nest_asyncio_err in str(e):
                 raise RuntimeError(nest_asyncio_msg)
@@ -545,7 +632,61 @@ class LlamaParse(BasePydanticReader):
     def get_images(self, json_result: List[dict], download_path: str) -> List[dict]:
         """Download images from the parsed result."""
         try:
-            return asyncio.run(self.aget_images(json_result, download_path))
+            return asyncio_run(self.aget_images(json_result, download_path))
+        except RuntimeError as e:
+            if nest_asyncio_err in str(e):
+                raise RuntimeError(nest_asyncio_msg)
+            else:
+                raise e
+
+    async def aget_xlsx(
+        self, json_result: List[dict], download_path: str
+    ) -> List[dict]:
+        """Download images from the parsed result."""
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+
+        # make the download path
+        if not os.path.exists(download_path):
+            os.makedirs(download_path)
+        try:
+            xlsx_list = []
+            for result in json_result:
+                job_id = result["job_id"]
+                if self.verbose:
+                    print("> XLSX")
+
+                xlsx_path = os.path.join(download_path, f"{job_id}.xlsx")
+
+                xlsx = {}
+
+                xlsx["path"] = xlsx_path
+                xlsx["job_id"] = job_id
+                xlsx["original_file_path"] = result.get("file_path", None)
+
+                with open(xlsx_path, "wb") as f:
+                    xlsx_url = (
+                        f"{self.base_url}/api/parsing/job/{job_id}/result/raw/xlsx"
+                    )
+                    async with self.client_context() as client:
+                        res = await client.get(
+                            xlsx_url, headers=headers, timeout=self.max_timeout
+                        )
+                        res.raise_for_status()
+                        f.write(res.content)
+                xlsx_list.append(xlsx)
+            return xlsx_list
+
+        except Exception as e:
+            print("Error while downloading xlsx:", e)
+            if self.ignore_errors:
+                return []
+            else:
+                raise e
+
+    def get_xlsx(self, json_result: List[dict], download_path: str) -> List[dict]:
+        """Download xlsx from the parsed result."""
+        try:
+            return asyncio_run(self.aget_xlsx(json_result, download_path))
         except RuntimeError as e:
             if nest_asyncio_err in str(e):
                 raise RuntimeError(nest_asyncio_msg)
